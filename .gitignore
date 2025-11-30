@@ -1,0 +1,4 @@
+*.elf
+*.tns
+*.o
+.idea/

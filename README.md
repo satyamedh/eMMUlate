@@ -15,5 +15,6 @@ This is an unpatchable exploit to extract the BootROM keys which allows for fire
 
 ## Some thanks
 - Vogtinator for pointing me towards the right direction and some "hints" :D
-- Adriweb and sasdallas for their support and help.
+- Sasdallas for his expertise is C and helping me clean up the code
+- Adriweb for the nice name :D
 - https://github.com/ricmoo/QRCode for the QR code library
