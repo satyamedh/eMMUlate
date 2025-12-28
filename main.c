@@ -12,20 +12,14 @@
 #include <string.h>
 #include "qrcode/qrcode.h"
 
-static inline uint32_t get_ttbr0(void) {
-    uint32_t val;
-    asm volatile("mrc p15, 0, %0, c2, c0, 0" : "=r"(val));
-    return val;
-}
+/* MMU flags */
+#define MMU_SECTION     (0b10)
+#define MMU_AP_RW      (0b11<<10)   // Full access
+#define MMU_CACHEABLE  (1<<3)
+#define MMU_BUFFERABLE (1<<2)
 
 static inline void set_ttbr0(uint32_t val) {
     asm volatile("mcr p15, 0, %0, c2, c0, 0" :: "r"(val));
-}
-
-static inline uint32_t get_dacr(void) {
-    uint32_t val;
-    asm volatile("mrc p15, 0, %0, c3, c0, 0" : "=r"(val));
-    return val;
 }
 
 static inline void set_dacr(uint32_t val) {
@@ -45,10 +39,18 @@ static inline void clean_dcache_range(uint32_t start, uint32_t end) {
     asm volatile("mcr p15, 0, %0, c7, c10, 4" :: "r"(0));
 }
 
-uint8_t page_table_buffer[0x8000]; 
-uint8_t vector_buffer[0x4000]; 
-uint8_t cpta_vectors_buffer[0x1000]; // 4KB for vector page table
-uint8_t cpta_stack_buffer[0x1000]; // 4KB for stack page table
+// malloc with alignment
+void *malloc_a(size_t align, size_t size) {
+    void *ptr = malloc(size + align - 1);
+    if (!ptr) return NULL;
+    uintptr_t addr = (uintptr_t)ptr;
+    addr = (addr + align - 1) & ~(align - 1);
+    return (void *)addr;
+}
+
+/* Normally this would just be a static array, but Zehn doesn't support __attribute__((aligned)) yet. */
+/* New TTB to load */
+uint32_t *ttb = NULL;
 
 // Global state for key extraction
 uint32_t key_params[] = {0x27, 0x3d, 0x25, 0x2d};
@@ -143,7 +145,7 @@ void perform_exploit_setup(void) {
     printf("Performing exploit setup...\n");
 
 	// these are the observed conditions that 0x39c is in when called via bootloader.
-	volatile uint32_t *usb_top = (volatile uint32_t *)0xB0000000;
+    volatile uint32_t *usb_top = (volatile uint32_t *)0xB0000000;
 	usb_top[0x100 / 4] = 0;
 
 	usb_top[0x1C0 / 4] = 0;
@@ -436,6 +438,11 @@ void __attribute__((noreturn)) exploit_payload(void) {
     trigger_next_key();
 }
 
+/* perform MMU mapping */
+void mmu_map(uintptr_t vaddr, uintptr_t paddr, uint32_t flags) {
+    ttb[vaddr >> 20] = (paddr & 0xFFF00000) | MMU_SECTION | flags;
+}
+
 int main(void) {
 
     printf("\
@@ -451,29 +458,58 @@ int main(void) {
     printf("Press any key to begin...\n");
     _wait_key_pressed();
     
-    // we're about to mess with OS so malloc() won't work, stdout needs to be unbuffered
+    // we're about to mess with OS so malloc() won't work during the exploit, stdout needs to be unbuffered
     setbuf(stdout, NULL); 
+
+    // Allocate and clear the TTB
+    // We use malloc here to be able to align each page and what not properly. __attribute__((aligned)) doesn't work with the Zehn format at the time of writing 
+    ttb = malloc_a(16384, 16384);
+    memset(ttb, 0, 16384);
+    if (!ttb) {
+        printf("Error: Out of memory trying to allocate TTB\n");
+        printf("Press any key to exit...\n");
+        _wait_key_pressed();
+        return 1;
+    }
+    
+    // Allocate vector page
+    uint32_t *vectors = (uint32_t*)malloc_a(4096, 4096);
+    if (!vectors) {
+        printf("Error: Out of memory trying to allocate a vector page\n");
+        printf("Press any key to exit...\n");
+        _wait_key_pressed();
+        return 1;
+    }
+
+    // Allocate coarse vector table page
+    uint32_t *coarse_vec_table = malloc_a(4096, 4096);
+
+    if (!coarse_vec_table) {
+        printf("Error: Out of memory trying to allocate a coarse vector page\n");
+        printf("Press any key to exit...\n");
+        _wait_key_pressed();
+        return 1;
+    }
+
+    // Allocate the vector stack page
+    uint32_t *vector_stack_table = malloc_a(4096, 4096);
+    if (!vector_stack_table) {
+        printf("Error: Out of memory trying to allocate a vector stack page\n");
+        printf("Press any key to exit...\n");
+        _wait_key_pressed();
+        return 1;
+    }
 
     // interrupts must be disabled
     intmask = TCT_Local_Control_Interrupts(-1); 
 
     printf("Starting MMU setup...\n");
 
-    uint32_t pt_addr = ((uint32_t)page_table_buffer + 0x3FFF) & ~0x3FFF;
-    uint32_t *page_table = (uint32_t *)pt_addr;
-
-    uint32_t vec_addr = ((uint32_t)vector_buffer + 0xFFF) & ~0xFFF; 
-    uint32_t *vectors = (uint32_t *)vec_addr;
-
-    uint32_t cpta_vec_addr = ((uint32_t)cpta_vectors_buffer + 0x3FF) & ~0x3FF;
-    uint32_t *coarse_vec_table = (uint32_t *)cpta_vec_addr;
-
-    uint32_t cpta_stack_addr = ((uint32_t)cpta_stack_buffer + 0x3FF) & ~0x3FF;
-    uint32_t *coarse_stack_table = (uint32_t *)cpta_stack_addr;
-
     // build vector table
-    printf("Setting up vector table at 0x%08lX...\n", vec_addr);
-    for (int i = 0; i < 8; i++) vectors[i] = 0xE59FF018;
+    // We can't actually modify 0x0 or any of the BootROM mapped memory since it's, well, ROM.
+    // Instead we will enable high vectors and set a mapping at 0xFFFF0000
+    printf("Setting up vector table at 0x%08lX...\n", vectors);
+    for (int i = 0; i < 8; i++) vectors[i] = 0xE59FF018; // ldr pc, [pc, #0x18]
     vectors[8] = (uint32_t)reset_handler;
     vectors[9] = (uint32_t)undef_handler;
     vectors[10] = (uint32_t)svc_handler;
@@ -484,88 +520,94 @@ int main(void) {
     vectors[15] = (uint32_t)fiq_handler;
 
     // build a new page table
-    printf("Setting up page table at 0x%08lX...\n", pt_addr);
-    memset(page_table, 0, 16384);
+    printf("Setting up page table at 0x%08lX...\n", ttb);
     memset(coarse_vec_table, 0, 1024);
-    memset(coarse_stack_table, 0, 1024);
+    memset(vector_stack_table, 0, 1024);
 
-    // keep BR mapping intact
-    page_table[0] = (0x00000000 & 0xFFF00000) | (0b11 << 10) | (0 << 5) | 0 | 0b10;
+    // Do the initial mappings
+    mmu_map(0x0, 0x0, MMU_AP_RW); 
     
     // identity map 0x10000000 - 0x14000000
     for (uint32_t addr = 0x10000000; addr < 0x14000000; addr += 0x100000) {
-        uint32_t idx = addr >> 20;
-
-        uint32_t cb = (1 << 3) | (1 << 2);
-        page_table[idx] = (addr & 0xFFF00000) | (0b11 << 10) | (0 << 5) | cb | 0b10;
+        mmu_map(addr, addr, MMU_AP_RW | MMU_CACHEABLE | MMU_BUFFERABLE);
     }
 
-    // map some additional peripherals
-    uint32_t a0_idx = 0xA0000000 >> 20;
-    page_table[a0_idx] = (0xA0000000 & 0xFFF00000) | (0b11 << 10) | (0 << 5) | 0 | 0b10;
-
-    uint32_t a4_idx = 0xA4000000 >> 20;
-    page_table[a4_idx] = (0xA4000000 & 0xFFF00000) | (0b11 << 10) | (0 << 5) | 0 | 0b10;
-
-    for (uint32_t addr = 0x90000000; addr < 0x91000000; addr += 0x100000) {
-        uint32_t idx = addr >> 20;
-        page_table[idx] = (addr & 0xFFF00000) | (0b11 << 10) | (0 << 5) | 0 | 0b10;
-    }
-
+    // Remap all the peripherals
     uint32_t periphs[] = {
-        0xA8000000, 
-        0xB0000000, 
-        0xB4000000, 
-        0xB8000000, 
-        0xBC000000, 
-        0xC0000000, 
-        0xCC000000, 
-        0xDC000000,
+        0x90000000, // GPIO
+        0x90010000, // Fast timer
+        0x90020000, // UART
+        0x90030000, // Fastboot RAM
+        0x90040000, // SPI controller
+        0x90050000, // I2C controller
+        0x90060000, // Watchdog timer
+        0x90070000, // Second UART
+        0x90080000, // Cradle SPI
+        0x90090000, // RTC
+        0x900A0000, // Misc.
+        0x900B0000, // ADC
+        0x900C0000, // First timer
+        0x900D0000, // Second timer
+        0x900E0000, // Keypad controller
+        0x90120000, // SDRAM controller
+        0x90130000, // LCD backlight controller
+        0x90140000, // Aladdin
+        0xA0000000, // Boot1 ROM mirror
+        0xA4000000, // Internal SRAM
+        0xA8000000, // Magic VRAM
+        0xB0000000, // USB OTG controller top
+        0xB4000000, // USB OTG controller bot
+        0xB8000000, // SPI NAND controller
+        0xBC000000, // DMA controller
+        0xC0000000, // LCD controller
+        0xCC000000, // SHA-256 hash generator
+        0xDC000000, // Interrupt controller
     };
+
     for (unsigned int i = 0; i < sizeof(periphs)/sizeof(periphs[0]); i++) {
-        uint32_t addr = periphs[i];
-        uint32_t idx = addr >> 20;
-        page_table[idx] = (addr & 0xFFF00000) | (0b11 << 10) | (0 << 5) | 0 | 0b10;
+        mmu_map(periphs[i], periphs[i], MMU_AP_RW); // MMIO prolly shouldn't be cacheable or bufferable
     }
 
-    page_table[0xFFF] = (cpta_vec_addr & 0xFFFFFC00) | (0 << 5) | 0b01;
-    coarse_vec_table[0xF0] = (vec_addr & 0xFFFFF000) | (0xFF << 4) | (0 << 3) | (0 << 2) | 0b10;
+    // Now we can map the high vector table into memory
+    ttb[0xFFF] = ((uint32_t)coarse_vec_table & 0xFFFFFC00) | (0 << 5) | 0b01;
+    coarse_vec_table[0xF0] = ((uint32_t)vectors & 0xFFFFF000) | (0xFF << 4) | (0 << 3) | (0 << 2) | 0b10;
 
     // we will change the triple-DES key engine mapping to point to 0x13000000 instead of the MMIO 0xc8000000
     // this will trick 0x39c into writing into a readable portion of memory
     // the triple-DES engine is not readable
     uint32_t des_va_idx = 0xC8000000 >> 20;
-    page_table[des_va_idx] = (0x13000000 & 0xFFF00000) | (0b11 << 10) | (0 << 5) | 0 | 0b10;
+    ttb[des_va_idx] = (0x13000000 & 0xFFF00000) | MMU_AP_RW | MMU_SECTION;
 
-    page_table[0x180] = (cpta_stack_addr & 0xFFFFFC00) | (0 << 5) | 0b01;
+    // create the mapping for the vector stack
+    ttb[0x180] = ((uint32_t)vector_stack_table & 0xFFFFFC00) | (0 << 5) | 0b01;
 
     for (int i = 0; i < 16; i++) {
-        coarse_stack_table[i] = 0x13EF0FFD;
+        // this stack is perfectly positioned such that it will be pushed over the edge into a non-accessible page
+        // right before key reading, and we will catch it with a data abort.
+        vector_stack_table[i] = 0x13EF0FFD; 
     }
 
 
     printf("Activating new MMU configuration...\n");
     
     // clean caches
-    clean_dcache_range(pt_addr, pt_addr + 16384);
-    clean_dcache_range(cpta_vec_addr, cpta_vec_addr + 1024);
-    clean_dcache_range(cpta_stack_addr, cpta_stack_addr + 1024);
-    clean_dcache_range(vec_addr, vec_addr + 4096);
+    clean_dcache_range((uint32_t)ttb, (uint32_t)ttb + 16384);
+    clean_dcache_range((uint32_t)coarse_vec_table, (uint32_t)coarse_vec_table + 4096);
+    clean_dcache_range((uint32_t)vector_stack_table, (uint32_t)vector_stack_table + 4096);
+    clean_dcache_range((uint32_t)vectors, (uint32_t)vectors + 4096);
 
     // set new config
-    set_ttbr0(pt_addr);
+    set_ttbr0((uint32_t)ttb);
     set_dacr(0x3); 
 
-    // high vector enable
+    // high vector enable + invalidate the TLB just in case
     uint32_t sctlr;
     asm volatile("mrc p15, 0, %0, c1, c0, 0" : "=r"(sctlr));
     sctlr |= (1 << 13) | (1 << 0);
     asm volatile("mcr p15, 0, %0, c1, c0, 0" :: "r"(sctlr));
-
     tlb_invalidate();
 
-    printf("MMU setup complete. High Vectors enabled.\n");
-
+    printf("MMU setup finished\n");
     printf("Switching stack and jumping to payload...\n");
 
     // fire!
