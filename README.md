@@ -1,6 +1,4 @@
 # eMMUlate
-#### Or nDEStruction
-#### Or nCryptor
 
 This is an unpatchable exploit to extract the BootROM keys which allows for firebird emulation. It uses the MMU to trick the CPU, hence the name, eMMUlate.
 
